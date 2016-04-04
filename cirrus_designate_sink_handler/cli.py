@@ -15,13 +15,13 @@
 # under the License.
 
 import cirrus_designate_sink_handler.notification_handler.cirrus_floating_ip_handler as cirrus
-from designate.openstack.common import log as logging
+from oslo_log import log as logging
 from designate.utils import find_config
 from designate.context import DesignateContext
 from designate import rpc
 from designate import policy
 from keystoneclient.v2_0 import client as keystone_c
-from oslo.config import cfg
+from oslo_config import cfg
 
 PROG = 'designate-cirrus-sink'
 LOG = logging.getLogger(__name__)

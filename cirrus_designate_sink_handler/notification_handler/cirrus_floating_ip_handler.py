@@ -20,14 +20,15 @@ import re
 
 from designate.notification_handler.base import BaseAddressHandler
 import designate.notification_handler.base
-from designate.openstack.common import log as logging
+from oslo_log import log as logging
 from designate.objects import Record
+from designate.objects import FloatingIP
 import designate.exceptions
 from designate.context import DesignateContext
 from keystoneclient.v2_0 import client as keystone_c
 from neutronclient.v2_0 import client as neutron_c
 from novaclient.v2 import client as nova_c
-from oslo.config import cfg
+from oslo_config import cfg
 
 LOG = logging.getLogger(__name__)
 
@@ -37,16 +38,17 @@ cfg.CONF.register_group(cfg.OptGroup(
 ))
 
 cfg.CONF.register_opts([
-    cfg.ListOpt('notification-topics', default=['notifications']),
+    cfg.ListOpt('notification-topics', default=['notifications_designate']),
     cfg.StrOpt('control-exchange', default='neutron'),
-    cfg.StrOpt('region_name', default=None),
-    cfg.StrOpt('keystone_auth_uri', default=None),
-    cfg.StrOpt('default_regex', default='\(default\)$'),
-    cfg.BoolOpt('require_default_regex', default=False),
+    cfg.StrOpt('region-name', default=None),
+    cfg.StrOpt('keystone-auth-uri', default=None),
+    cfg.StrOpt('domain-id', default=None),
+    cfg.StrOpt('default-regex', default='\(default\)$'),
+    cfg.BoolOpt('require-default-regex', default=False),
     cfg.StrOpt('format', default='%(instance_short_name)s.%(domain)s'),
-    cfg.StrOpt('format_fallback',
+    cfg.StrOpt('format-fallback',
                default='%(instance_short_name)s-%(octet0)s-%(octet1)s-%(octet2)s-%(octet3)s.%(domain)s'),
-], group='handler:cirrus_floating_ip')
+], group='handler:cirrus_floatingip')
 
 
 class CirrusRecordExists(Exception):
@@ -55,7 +57,7 @@ class CirrusRecordExists(Exception):
 
 class CirrusFloatingIPHandler(BaseAddressHandler):
     """Handler for Neutron notifications."""
-    __plugin_name__ = 'cirrus_floating_ip'
+    __plugin_name__ = 'cirrus_floatingip'
     __plugin_type__ = 'handler'
 
     def get_exchange_topics(self):
@@ -72,13 +74,17 @@ class CirrusFloatingIPHandler(BaseAddressHandler):
             'port.delete.end',
         ]
 
+    def _get_ip_data(self, addr_dict):
+        data = super(CirrusFloatingIPHandler, self)._get_ip_data(addr_dict)
+        return data
+
     # RFC 952/1123 allow only A-Z, a-z, 0-9, and -
     # We'll swap all other special characters with '-',
     # this may lead to a collision but at least has a possibility
     # to work.
     # Additionally each section of a domain name may only be
     # 63 characters long, so we'll truncate that too.
-    def _scrub_instance_name(name=""):
+    def _scrub_instance_name(self, name=""):
         scrubbed = ""
         for char in name:
             if char.isalnum() or char == '.' or char == '-':
@@ -118,7 +124,7 @@ class CirrusFloatingIPHandler(BaseAddressHandler):
         server_info = nvc.servers.get(instance_id)
         LOG.debug('Instance name for id %s is %s' % (instance_id, server_info.name))
         instance_info['original_name'] = server_info.name
-        instance_info['scrubbed_name'] = _scrub_instance_name(server_info.name)
+        instance_info['scrubbed_name'] = self._scrub_instance_name(server_info.name)
         if instance_info['original_name'] != instance_info['scrubbed_name']:
             LOG.warn('Instance name for id %s contains characters that cannot be used'
                     ' for a valid DNS record. It was scrubbed from %s to %s'
@@ -147,6 +153,12 @@ class CirrusFloatingIPHandler(BaseAddressHandler):
                 if re.search(default_regex, domain.description):
                     return domain
 
+        # Fallback to default domain if available
+        domain_id = cfg.CONF[self.name].domain_id
+        if domain_id is not None:
+            domain = self.get_domain(domain_id)
+            return domain
+
         return None
 
     def _create(self, context, addresses, name_format, extra, domain_id,
@@ -166,7 +178,7 @@ class CirrusFloatingIPHandler(BaseAddressHandler):
         names = []
         for addr in addresses:
             event_data = data.copy()
-            event_data.update(designate.notification_handler.base.get_ip_data(addr))
+            event_data.update(self._get_ip_data(addr))
 
             recordset_values = {
                 'domain_id': domain_id,
@@ -199,6 +211,14 @@ class CirrusFloatingIPHandler(BaseAddressHandler):
                                            domain_id,
                                            recordset['id'],
                                            Record(**record_values))
+            values = {
+                'ptrdname': recordset_values['name'],
+                'description': None
+            }
+            self.central_api.update_floatingip(context,
+                                               cfg.CONF[self.name].region_name,
+                                               resource_id,
+                                               FloatingIP(**values))
             names.append(recordset_values['name'])
         return names
 
@@ -260,11 +280,25 @@ class CirrusFloatingIPHandler(BaseAddressHandler):
         LOG.debug('Found %d records to delete that matched floating ip %s' %
                   (len(records), floating_ip_id))
         for record in records:
-            LOG.debug('Deleting record %s with IP %s' % (record['id'], record['data']))
-            self.central_api.delete_record(context,
-                                           record['domain_id'],
-                                           record['recordset_id'],
-                                           record['id'])
+            LOG.debug('Deleting record %s with IP %s from %s' % (record['id'], record['data'], record['domain_id']))
+            try:
+                self.central_api.delete_record(context,
+                                               record['domain_id'],
+                                               record['recordset_id'],
+                                               record['id'])
+            except designate.exceptions.DomainNotFound:
+                pass
+
+            values = {
+                'ptrdname': None
+            }
+            try:
+                self.central_api.update_floatingip(context,
+                                                   cfg.CONF[self.name].region_name,
+                                                   floating_ip_id,
+                                                   FloatingIP(**values))
+            except:
+                pass
 
         LOG.info('Deleted %d records that matched floating ip %s' %
                  (len(records), floating_ip_id))
@@ -292,10 +326,25 @@ class CirrusFloatingIPHandler(BaseAddressHandler):
                   (len(records), port_id))
         for record in records:
             LOG.debug('Deleting record %s' % (record['id']))
-            self.central_api.delete_record(context,
-                                           record['domain_id'],
-                                           record['recordset_id'],
-                                           record['id'])
+
+            try:
+                self.central_api.delete_record(context,
+                                               record['domain_id'],
+                                               record['recordset_id'],
+                                               record['id'])
+            except designate.exceptions.DomainNotFound:
+                pass
+
+            try:
+                values = {
+                    'ptrdname': None
+                }
+                self.central_api.update_floatingip(context,
+                                                   cfg.CONF[self.name].region_name,
+                                                   record['managed_resource_id'],
+                                                   FloatingIP(**values))
+            except:
+                pass
 
         LOG.info('Deleted %d records that matched port_id %s' %
                  (len(records), port_id))
@@ -357,7 +406,7 @@ class CirrusFloatingIPHandler(BaseAddressHandler):
                     LOG.info('No domains found for tenant %s(%s), ignoring Floating IP update for %s' %
                              (context['tenant_name'], context['tenant_id'], floating_ip))
                 else:
-                    LOG.debug('Using domain %s(%s) for tenant %s(%s)' %
+                    LOG.info('Using domain %s(%s) for tenant %s(%s)' %
                               (domain.name, domain.id,
                                context['tenant_name'], context['tenant_id']))
 
@@ -372,6 +421,7 @@ class CirrusFloatingIPHandler(BaseAddressHandler):
                     extra = payload.copy()
                     extra.update({'instance_name': instance_info['name'],
                                   'instance_short_name': instance_info['name'].partition('.')[0],
+                                  'project': context['tenant_name'],
                                   'domain': domain.name})
                     self._associate_floating_ip(context=elevated_context,
                                                 domain_id=domain.id,
