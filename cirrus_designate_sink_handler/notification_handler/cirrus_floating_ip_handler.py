@@ -164,7 +164,7 @@ class CirrusFloatingIPHandler(BaseAddressHandler):
 
         return instance_info
 
-    def _pick_tenant_domain(self, tenant_id, metadata={}):
+    def _pick_tenant_domain(self, tenant_id):
         """Pick the appropriate domain to create floating ip records in
 
         If no appropriate domains can be found, it will return `None`.  If a single
@@ -338,9 +338,13 @@ class CirrusFloatingIPHandler(BaseAddressHandler):
             client = instance_info['client']
             for name in names:
                 LOG.info('Created %s to point at %s' % (name['name'], name['addr']))
-                client.servers.set_meta_item(instance_info['server'],
-                                             'hostname-%s' % name['addr'],
-                                             name['name'])
+                # Neat idea, but instances may still be building.  Try to find
+                # a better way of doing this...possibly queuing an even to handle
+                # it later.  Or maybe the compute.instance.update event.
+                #
+                #client.servers.set_meta_item(instance_info['server'],
+                #                             'hostname-%s' % name['addr'],
+                #                             name['name'])
 
     def _disassociate(self, tenant_id, floatingip_id=None, port_id=None):
         """Remove A and associated PTR records
